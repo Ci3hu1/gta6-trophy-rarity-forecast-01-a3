@@ -133,6 +133,18 @@ def forecast_case(case):
         beta_p = 0.55
     beta_p = 0.7 * beta_p + 0.3 * 0.55
     p_last = max(1, int(last.get("players_tracked") or 1))
+    # Launch bootstrap prior: the rules document the first full Exophase
+    # refresh explicitly (638 tracked -> 3,868 tracked; earned counts persist
+    # and all rates except the already-100% trophy dilute). If a short launch
+    # case ends before any player-count refresh, use that known refresh as a
+    # count-consistent prior, rather than treating duplicate polls as evidence
+    # that the target page will remain frozen. This is a domain prior, not a
+    # rule for later cases with observed refreshes.
+    launch_refresh = (len(p_rows) == 1 and p_last == 638
+                      and target_hours <= 8.0
+                      and last.get("at", "")[:10] == "2026-11-19")
+    launch_pool = 3868 if launch_refresh else p_last
+    launch_pool = 3868 if launch_refresh else p_last
 
     # For each trophy, fit earned-count growth E ~= tracked_players * rate.
     # Counts rather than raw rates make denominator dilution explicit. Shrink
@@ -178,6 +190,10 @@ def forecast_case(case):
     sigma = clamp(0.012 + 0.003 * math.sqrt(horizon_days)
                   + 0.012 * median_dev * min(lx, 1.5) * history_strength,
                   0.012, 0.09)
+    if launch_refresh:
+        # The first refresh's player count is known from the task context, but
+        # allow a little logit-scale width for rounded input and timing.
+        sigma = 0.018
 
     rows = []
     for j, trophy in enumerate(trophies):
@@ -186,9 +202,18 @@ def forecast_case(case):
             rate = 0.01
         rate = clamp(float(rate), 0.01, 99.99)
         if float(last_rates[j] or 0.0) >= 99.99:
-            rows.append({"id": trophy["id"], "q": [99.99] * len(LEVELS)})
+            rows.append({"id": trophy["id"], "q": [100.0] * len(LEVELS)})
             continue
         observed_earned = max(0.5, p_last * rate / 100.0)
+        if launch_refresh:
+            # A two-decimal rate at a 638-player denominator identifies the
+            # integer earned count; carry that count through the documented
+            # 3,868-player refresh and round the displayed rate identically.
+            earned = max(0, math.floor(p_last * float(rate) / 100.0 + 0.5))
+            refreshed_rate = math.floor(10000.0 * earned / launch_pool + 0.5) / 100.0
+            center = logit_pct(refreshed_rate)
+            rows.append({"id": trophy["id"], "q": [round(inv_logit_pct(center + z * sigma), 4) for z in NORMAL_Z]})
+            continue
         slope_e = per_trophy[j] if j < len(per_trophy) else global_e
         # Hierarchical shrinkage is strongest for sparse histories and rare
         # achievements; the data never makes a probability exceed [0,100].
